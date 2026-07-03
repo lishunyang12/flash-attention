@@ -345,7 +345,15 @@ class FlashAttentionForwardSm100:
         smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
-        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+        # Mixed fp8-QK / 16-bit-V mode: K and V get separate smem buffers
+        # (their swizzle families differ, so byte-aliased stage sharing is
+        # unsound); budget the sum instead of the max.
+        self.mixed_kv_smem = self.k_dtype.width != self.v_dtype.width
+        smem_size_kv_per_stage = (
+            smem_size_k_per_stage + smem_size_v_per_stage
+            if self.mixed_kv_smem
+            else max(smem_size_k_per_stage, smem_size_v_per_stage)
+        ) // self.cta_group_size
         # Cap small head_dim from over-staging: the 224*1024 budget undercounts
         # per-stage state, so at hd_padded=16 the unbounded formula picks 52 stages
         # and overflows the 227 KB SMEM cap. No-op for hd_padded >= 32 (max 26).
@@ -537,10 +545,10 @@ class FlashAttentionForwardSm100:
         sO_layout = sm100_utils_basic.make_smem_layout_epi(
             self.o_dtype, self.o_layout, self.epi_tile, self.q_stage
         )
-        if const_expr(not self.same_hdim_kv_padded or self.k_dtype.width != self.v_dtype.width):
+        if const_expr(not self.same_hdim_kv_padded and not self.mixed_kv_smem):
             # sK and sV are using the same physical smem so we need to adjust the stride so that
-            # they line up. Strides are per-dtype element counts, so align stages in BYTES —
-            # required when K and V dtypes have different widths (mixed fp8-QK / 16-bit-V mode).
+            # they line up. Strides are per-dtype element counts, so align stages in BYTES.
+            # (Mixed-dtype mode uses separate buffers; no alignment needed there.)
             stride_sK = const_expr(
                 max(sK_layout.outer.stride[-1], 0)
             )  # take max to turn tuple to Int32
@@ -702,6 +710,13 @@ class FlashAttentionForwardSm100:
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
 
+        # Mixed-dtype mode: V lives after the K stages in the same MemRange
+        # (expressed in k_dtype elements). K's total is a multiple of 1024B,
+        # so the V region keeps TMA/swizzle alignment.
+        sKV_size = cute.cosize(sK_layout)
+        if const_expr(self.mixed_kv_smem):
+            sKV_size = sKV_size + cute.cosize(sV_layout) * self.v_dtype.width // self.k_dtype.width
+
         @cute.struct
         class SharedStorage:
             # m_barriers for pipelines
@@ -735,8 +750,9 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes
             ]
             sK: cute.struct.Align[
-                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
-                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem.
+                # In mixed-dtype mode this range also carries sV, placed after the K stages.
+                cute.struct.MemRange[self.k_dtype, sKV_size],
                 self.buffer_align_bytes,
             ]
 
@@ -1046,10 +1062,14 @@ class FlashAttentionForwardSm100:
         # (MMA, MMA_K, MMA_D, PIPE)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
-        # Strip swizzle info to reuse smem; recast to v_dtype (differs from
-        # k_dtype in mixed fp8-QK / 16-bit-V mode).
+        # Strip swizzle info to reuse smem. In mixed-dtype mode V has its own
+        # region after the K stages (different swizzle family); otherwise V
+        # aliases K's stages as usual.
+        _sV_base = sK.iterator
+        if const_expr(self.mixed_kv_smem):
+            _sV_base = _sV_base + cute.cosize(sK_layout)
         sV = cute.make_tensor(
-            cute.recast_ptr(sK.iterator, sV_layout.inner, self.v_dtype), sV_layout.outer
+            cute.recast_ptr(_sV_base, sV_layout.inner, self.v_dtype), sV_layout.outer
         )
         if const_expr(not self.overlap_sO_sQ):
             sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
