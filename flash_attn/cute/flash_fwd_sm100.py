@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
@@ -344,11 +345,22 @@ class FlashAttentionForwardSm100:
         smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
-        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+        # Mixed fp8-QK / 16-bit-V mode: K and V get separate smem buffers
+        # (their swizzle families differ, so byte-aliased stage sharing is
+        # unsound); budget the sum instead of the max.
+        self.mixed_kv_smem = self.k_dtype.width != self.v_dtype.width
+        smem_size_kv_per_stage = (
+            smem_size_k_per_stage + smem_size_v_per_stage
+            if self.mixed_kv_smem
+            else max(smem_size_k_per_stage, smem_size_v_per_stage)
+        ) // self.cta_group_size
         # Cap small head_dim from over-staging: the 224*1024 budget undercounts
         # per-stage state, so at hd_padded=16 the unbounded formula picks 52 stages
         # and overflows the 227 KB SMEM cap. No-op for hd_padded >= 32 (max 26).
         kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 32)
+        _kv_cap = os.environ.get("FA_KV_STAGE_CAP")  # debug knob
+        if _kv_cap is not None:
+            kv_stage = min(kv_stage, int(_kv_cap))
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
@@ -443,9 +455,14 @@ class FlashAttentionForwardSm100:
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if const_expr(self.q_dtype != self.v_dtype):
+        if const_expr(
+            self.q_dtype != self.v_dtype
+            and not (self.q_dtype.width == 8 and self.v_dtype.width == 16)
+        ):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        if const_expr(self.q_dtype.width == 8):
+        if const_expr(self.q_dtype.width == 8 and self.v_dtype.width == 8):
+            # Pure-fp8 register/ex2 tuning; mixed fp8-QK / 16-bit-V mode keeps
+            # the default allocation (its softmax/load paths match 16-bit kernels).
             paged_kv_non_tma = not self.use_tma_KV
             if const_expr(self.head_dim_padded < 96):
                 fp8_regs = _FP8_SMALL_HDIM_REGS[paged_kv_non_tma]
@@ -472,6 +489,12 @@ class FlashAttentionForwardSm100:
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
             ):
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
+
+        if const_expr(self.q_dtype.width == 8 and self.v_dtype.width != 8):
+            # The emulated-exp2 convert packs P in fp8; P is v_dtype in
+            # mixed fp8-QK / 16-bit-V mode, so use the exact exp2 path.
+            self.enable_ex2_emu = False
+            self.ex2_emu_freq = 0
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = tcgen05.OperandMajorMode.K
@@ -514,7 +537,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_qk, self.mma_tiler_qk, self.k_dtype, self.kv_stage
         )
         tP_layout = sm100_utils_basic.make_smem_layout_a(
-            tiled_mma_pv, self.mma_tiler_pv, self.q_dtype, self.s_stage
+            tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.s_stage
         )
         sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.kv_stage
@@ -522,23 +545,29 @@ class FlashAttentionForwardSm100:
         sO_layout = sm100_utils_basic.make_smem_layout_epi(
             self.o_dtype, self.o_layout, self.epi_tile, self.q_stage
         )
-        if const_expr(not self.same_hdim_kv_padded):
-            # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
+        if const_expr(not self.same_hdim_kv_padded and not self.mixed_kv_smem):
+            # sK and sV are using the same physical smem so we need to adjust the stride so that
+            # they line up. Strides are per-dtype element counts, so align stages in BYTES.
+            # (Mixed-dtype mode uses separate buffers; no alignment needed there.)
             stride_sK = const_expr(
                 max(sK_layout.outer.stride[-1], 0)
             )  # take max to turn tuple to Int32
             stride_sV = const_expr(max(sV_layout.outer.stride[-1], 0))
-            stage_stride = const_expr(
-                max(stride_sK, stride_sV)
+            bytes_sK = const_expr(stride_sK * self.k_dtype.width // 8)
+            bytes_sV = const_expr(stride_sV * self.v_dtype.width // 8)
+            stage_bytes = const_expr(
+                max(bytes_sK, bytes_sV)
                 if not self.uneven_kv_smem
-                else (stride_sK + stride_sV) // 2
+                else (bytes_sK + bytes_sV) // 2
             )
+            stage_stride_k = const_expr(stage_bytes * 8 // self.k_dtype.width)
+            stage_stride_v = const_expr(stage_bytes * 8 // self.v_dtype.width)
             sK_layout = cute.make_composed_layout(
                 sK_layout.inner,
                 0,
                 cute.make_layout(
                     (*sK_layout.outer.shape[:-1], self.kv_stage),
-                    stride=(*sK_layout.outer.stride[:-1], stage_stride),
+                    stride=(*sK_layout.outer.stride[:-1], stage_stride_k),
                 ),
             )
             sV_layout = cute.make_composed_layout(
@@ -546,7 +575,7 @@ class FlashAttentionForwardSm100:
                 0,
                 cute.make_layout(
                     (*sV_layout.outer.shape[:-1], self.kv_stage),
-                    stride=(*sV_layout.outer.stride[:-1], stage_stride),
+                    stride=(*sV_layout.outer.stride[:-1], stage_stride_v),
                 ),
             )
 
@@ -681,6 +710,13 @@ class FlashAttentionForwardSm100:
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
 
+        # Mixed-dtype mode: V lives after the K stages in the same MemRange
+        # (expressed in k_dtype elements). K's total is a multiple of 1024B,
+        # so the V region keeps TMA/swizzle alignment.
+        sKV_size = cute.cosize(sK_layout)
+        if const_expr(self.mixed_kv_smem):
+            sKV_size = sKV_size + cute.cosize(sV_layout) * self.v_dtype.width // self.k_dtype.width
+
         @cute.struct
         class SharedStorage:
             # m_barriers for pipelines
@@ -714,8 +750,9 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes
             ]
             sK: cute.struct.Align[
-                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
-                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem.
+                # In mixed-dtype mode this range also carries sV, placed after the K stages.
+                cute.struct.MemRange[self.k_dtype, sKV_size],
                 self.buffer_align_bytes,
             ]
 
@@ -1025,8 +1062,15 @@ class FlashAttentionForwardSm100:
         # (MMA, MMA_K, MMA_D, PIPE)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
-        # Strip swizzle info to reuse smem
-        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        # Strip swizzle info to reuse smem. In mixed-dtype mode V has its own
+        # region after the K stages (different swizzle family); otherwise V
+        # aliases K's stages as usual.
+        _sV_base = sK.iterator
+        if const_expr(self.mixed_kv_smem):
+            _sV_base = _sV_base + cute.cosize(sK_layout)
+        sV = cute.make_tensor(
+            cute.recast_ptr(_sV_base, sV_layout.inner, self.v_dtype), sV_layout.outer
+        )
         if const_expr(not self.overlap_sO_sQ):
             sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
         else:
@@ -1935,7 +1979,8 @@ class FlashAttentionForwardSm100:
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(
-                tcgen05.copy.Repetition(8 if const_expr(self.q_dtype.width == 8) else 16)
+                # P is stored in v_dtype (the PV mma's A operand dtype).
+                tcgen05.copy.Repetition(8 if const_expr(self.v_dtype.width == 8) else 16)
             ),
             Float32,
         )
@@ -2011,7 +2056,11 @@ class FlashAttentionForwardSm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
+            # max_offset=8 leaves only 448/256 = 1.75x e4m3 headroom for the pipelined
+            # softmax's delayed-running-max overshoot (P~ can transiently exceed 1);
+            # wide-range logits (video DiTs, sigma>=1) then clip P silently -> ~13%%
+            # error. 4 keeps 28x headroom and measures best on real activations.
+            max_offset = int(os.environ.get('FA_MAX_OFFSET', '4')) if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2327,7 +2376,7 @@ class FlashAttentionForwardSm100:
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32
         )
         tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
@@ -2427,7 +2476,7 @@ class FlashAttentionForwardSm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
+            max_offset = Float32(float(os.environ.get('FA_MAX_OFFSET', '4'))) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             max_offset_scale = (
                 Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
