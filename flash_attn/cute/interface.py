@@ -405,10 +405,22 @@ def _flash_attn_fwd(
     input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
     present = {name: t for name, t in input_tensors.items() if t is not None}
     names = list(present.keys())
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            a, b = names[i], names[j]
-            assert present[a].dtype == present[b].dtype, f"{a}.dtype {present[a].dtype} != {b}.dtype {present[b].dtype}"
+    _fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    # Mixed-precision mode: fp8 Q/K for the QK^T mma with a 16-bit V (P is
+    # converted to v_dtype for the PV mma, so P and PV stay in bf16/fp16).
+    mixed_qk_fp8 = (
+        q is not None
+        and k is not None
+        and v is not None
+        and q.dtype in _fp8_dtypes
+        and k.dtype == q.dtype
+        and v.dtype in (torch.bfloat16, torch.float16)
+    )
+    if not mixed_qk_fp8:
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                a, b = names[i], names[j]
+                assert present[a].dtype == present[b].dtype, f"{a}.dtype {present[a].dtype} != {b}.dtype {present[b].dtype}"
 
     q_dtype = q.dtype if q is not None else qv.dtype
 
@@ -460,7 +472,7 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_fp8 = q_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
@@ -717,6 +729,7 @@ def _flash_attn_fwd(
 
     compile_key = (
         dtype,
+        v.dtype if v is not None else None,  # mixed fp8-QK / 16-bit-V mode compiles separately
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -1023,8 +1036,11 @@ def _flash_attn_fwd(
         ]
         if is_fp8:
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
+            # (view per-tensor: V may be bf16/fp16 in mixed fp8-QK mode)
             q_call, k_call, v_call, qv_call = [
-                t.view(torch.uint8) if t is not None else None
+                t.view(torch.uint8)
+                if t is not None and t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                else t
                 for t in (q_call, k_call, v_call, qv_call)
             ]
         descale_tensors = (
