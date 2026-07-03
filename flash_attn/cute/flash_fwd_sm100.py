@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
@@ -349,6 +350,9 @@ class FlashAttentionForwardSm100:
         # per-stage state, so at hd_padded=16 the unbounded formula picks 52 stages
         # and overflows the 227 KB SMEM cap. No-op for hd_padded >= 32 (max 26).
         kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 32)
+        _kv_cap = os.environ.get("FA_KV_STAGE_CAP")  # debug knob
+        if _kv_cap is not None:
+            kv_stage = min(kv_stage, int(_kv_cap))
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
@@ -448,7 +452,9 @@ class FlashAttentionForwardSm100:
             and not (self.q_dtype.width == 8 and self.v_dtype.width == 16)
         ):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        if const_expr(self.q_dtype.width == 8):
+        if const_expr(self.q_dtype.width == 8 and self.v_dtype.width == 8):
+            # Pure-fp8 register/ex2 tuning; mixed fp8-QK / 16-bit-V mode keeps
+            # the default allocation (its softmax/load paths match 16-bit kernels).
             paged_kv_non_tma = not self.use_tma_KV
             if const_expr(self.head_dim_padded < 96):
                 fp8_regs = _FP8_SMALL_HDIM_REGS[paged_kv_non_tma]
